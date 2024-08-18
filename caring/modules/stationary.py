@@ -7,12 +7,11 @@ import pytorch_lightning as pl
 import torch.distributions as D
 from torch.nn import functional as F
 import os
-from .components.beta import BetaVAE_MLP
-from .components.transition import (MBDTransitionPrior, 
-                                    NPTransitionPrior)
+from .components.beta import *
+from .components.transition import *
 from .components.mlp import MLPEncoder, MLPDecoder, Inference
 from .metrics.correlation import compute_mcc
-
+from pytorch_lightning.loggers import TensorBoardLogger
 import ipdb as pdb
 
 class StationaryProcess(pl.LightningModule):
@@ -95,14 +94,15 @@ class StationaryProcess(pl.LightningModule):
                                  num_layers=2)
 
         elif infer_mode == 'F':
-            self.net = BetaVAE_MLP(input_dim=input_dim, 
-                                   z_dim=z_dim, 
-                                   decoder_side_truez=decoder_side_truez,
-                                   decoder_side_hatz=decoder_side_hatz,
-                                   decoder_side_truex=decoder_side_truex,
-                                   encoder_side_truez=encoder_side_truez,
-                                   encoder_side_truex=encoder_side_truex,
-                                   hidden_dim=hidden_dim)
+            # self.net = BetaVAE_MLP(input_dim=input_dim, 
+            self.net = BetaVAE_SparseMLP(input_dim=input_dim, 
+                                        z_dim=z_dim, 
+                                        decoder_side_truez=decoder_side_truez,
+                                        decoder_side_hatz=decoder_side_hatz,
+                                        decoder_side_truex=decoder_side_truex,
+                                        encoder_side_truez=encoder_side_truez,
+                                        encoder_side_truex=encoder_side_truex,
+                                        hidden_dim=hidden_dim)
 
         # Initialize transition prior
         if trans_prior == 'L':
@@ -110,7 +110,11 @@ class StationaryProcess(pl.LightningModule):
                                                        latent_size=z_dim, 
                                                        bias=False)
         elif trans_prior == 'NP':
-            self.transition_prior = NPTransitionPrior(lags=lag, 
+            # self.transition_prior = NPTransitionPrior(lags=lag, 
+            #                                           latent_size=z_dim, 
+            #                                           num_layers=3, 
+            #                                           hidden_dim=hidden_dim)
+            self.transition_prior = NPSparseTransitionPrior(lags=lag, 
                                                       latent_size=z_dim, 
                                                       num_layers=3, 
                                                       hidden_dim=hidden_dim)
@@ -208,7 +212,8 @@ class StationaryProcess(pl.LightningModule):
             zs_flat = zs.contiguous().view(-1, self.z_dim)
             x_recon = self.dec(zs_flat)
         elif self.infer_mode == 'F':
-            x_recon, mus, logvars, zs = self.net(x, y)
+            # x_recon, mus, logvars, zs = self.net(x, y)
+            x_recon, mus, logvars, zs, jac_mixing, l1_penalty_mixing = self.net(x, y)
         # Reshape to time-series format
         x_recon = x_recon.view(batch_size, length, self.input_dim)
         mus = mus.reshape(batch_size, length, self.z_dim)
@@ -239,18 +244,31 @@ class StationaryProcess(pl.LightningModule):
         kld_normal = kld_normal.mean()
         # Future KLD
         log_qz_laplace = log_qz[:,enc_lag:]
-        residuals, logabsdet = self.transition_prior(zs)
+        # residuals, logabsdet = self.transition_prior(zs)
+        residuals, logabsdet, jac, xx_reg, yy_reg  = self.transition_prior(zs)
         sum_log_abs_det_jacobians = sum_log_abs_det_jacobians + logabsdet
         log_pz_laplace = torch.sum(self.base_dist.log_prob(residuals), dim=1) + sum_log_abs_det_jacobians
         kld_laplace = (torch.sum(torch.sum(log_qz_laplace,dim=-1),dim=-1) - log_pz_laplace) / (length-enc_lag)
         kld_laplace = kld_laplace.mean()
 
-        # VAE training
-        loss = recon_loss + self.beta * kld_normal + self.gamma * kld_laplace
+        # # VAE training for regular loss
+        # loss = recon_loss + self.beta * kld_normal + self.gamma * kld_laplace
+        
+        # VAE training for sparsity loss
+        loss = recon_loss + self.beta * kld_normal + self.gamma * kld_laplace 
+        # + l1_penalty_mixing + torch.stack(xx_reg,dim=-1).mean() + torch.stack(yy_reg, dim=-1).mean()
+    
         self.log("train_elbo_loss", loss)
         self.log("train_recon_loss", recon_loss)
         self.log("train_kld_normal", kld_normal)
         self.log("train_kld_laplace", kld_laplace)
+        
+        # Log metrics to TensorBoard
+        self.log("train/elbo_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train/recon_loss", recon_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train/kld_normal", kld_normal, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train/kld_laplace", kld_laplace, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -267,7 +285,8 @@ class StationaryProcess(pl.LightningModule):
             zs_flat = zs.contiguous().view(-1, self.z_dim)
             x_recon = self.dec(zs_flat)
         elif self.infer_mode == 'F':
-            x_recon, mus, logvars, zs = self.net(x, y)
+            # x_recon, mus, logvars, zs = self.net(x, y)
+            x_recon, mus, logvars, zs, jac_mixing, l1_penalty_mixing = self.net(x, y)
 
         # Reshape to time-series format
         x_recon = x_recon.view(batch_size, length, self.input_dim)
@@ -285,25 +304,6 @@ class StationaryProcess(pl.LightningModule):
         else:
             enc_lag = self.lag
 
-        # # VAE ELBO loss: recon_loss + kld_loss
-        # recon_loss = self.reconstruction_loss(x[:,:self.lag], x_recon[:,:self.lag], self.decoder_dist) + \
-        # (self.reconstruction_loss(x[:,self.lag:], x_recon[:,self.lag:], self.decoder_dist))/(length-self.lag)
-        # q_dist = D.Normal(mus, torch.exp(logvars / 2))
-        # log_qz = q_dist.log_prob(zs)
-        # # Past KLD
-        # p_dist = D.Normal(torch.zeros_like(mus[:,:self.lag]), torch.ones_like(logvars[:,:self.lag]))
-        # log_pz_normal = torch.sum(torch.sum(p_dist.log_prob(zs[:,:self.lag]),dim=-1),dim=-1)
-        # log_qz_normal = torch.sum(torch.sum(log_qz[:,:self.lag],dim=-1),dim=-1)
-        # kld_normal = log_qz_normal - log_pz_normal
-        # kld_normal = kld_normal.mean()
-        # # Future KLD
-        # log_qz_laplace = log_qz[:,self.lag:]
-        # residuals, logabsdet = self.transition_prior(zs)
-        # sum_log_abs_det_jacobians = sum_log_abs_det_jacobians + logabsdet
-        # log_pz_laplace = torch.sum(self.base_dist.log_prob(residuals), dim=1) + sum_log_abs_det_jacobians
-        # kld_laplace = (torch.sum(torch.sum(log_qz_laplace,dim=-1),dim=-1) - log_pz_laplace) / (length-self.lag)
-        # kld_laplace = kld_laplace.mean()
-
          # VAE ELBO loss: recon_loss + kld_loss
         recon_loss = self.reconstruction_loss(x[:,:dec_lag], x_recon[:,:dec_lag], self.decoder_dist) + \
         (self.reconstruction_loss(x[:,dec_lag:], x_recon[:,dec_lag:], self.decoder_dist))/(length-dec_lag)
@@ -317,14 +317,19 @@ class StationaryProcess(pl.LightningModule):
         kld_normal = kld_normal.mean()
         # Future KLD
         log_qz_laplace = log_qz[:,enc_lag:]
-        residuals, logabsdet = self.transition_prior(zs)
+        # residuals, logabsdet = self.transition_prior(zs)
+        residuals, logabsdet, jac, xx_reg, yy_reg  = self.transition_prior(zs)
         sum_log_abs_det_jacobians = sum_log_abs_det_jacobians + logabsdet
         log_pz_laplace = torch.sum(self.base_dist.log_prob(residuals), dim=1) + sum_log_abs_det_jacobians
         kld_laplace = (torch.sum(torch.sum(log_qz_laplace,dim=-1),dim=-1) - log_pz_laplace) / (length-enc_lag)
         kld_laplace = kld_laplace.mean()
 
-        # VAE training
-        loss = recon_loss + self.beta * kld_normal + self.gamma * kld_laplace
+        # # VAE training for regular loss
+        # loss = recon_loss + self.beta * kld_normal + self.gamma * kld_laplace
+        
+        # VAE training for sparsity loss
+        loss = recon_loss + self.beta * kld_normal + self.gamma * kld_laplace 
+        # + l1_penalty_mixing + torch.stack(xx_reg,dim=-1).mean() + torch.stack(yy_reg, dim=-1).mean()
 
         # Compute Mean Correlation Coefficient (MCC)
         mus_side = mus[:,enc_lag:].contiguous().view(-1, self.z_dim)
@@ -344,6 +349,13 @@ class StationaryProcess(pl.LightningModule):
             self.bestmcc = mcc
         self.log("val_best_mcc", self.bestmcc)
         
+        # Log metrics to TensorBoard
+        self.log("val/mcc", mcc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val/elbo_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val/recon_loss", recon_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val/kld_normal", kld_normal, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val/kld_laplace", kld_laplace, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val/best_mcc", self.bestmcc, on_step=False, on_epoch=True, prog_bar=True, logger=True)  
 
         return loss
     

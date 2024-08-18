@@ -1,3 +1,6 @@
+import sys
+sys.path.append("/home/lidwh/CaRiNG")
+
 import torch
 import random
 import argparse
@@ -11,6 +14,7 @@ from caring.tools.utils import load_yaml, setup_seed
 from caring.datasets.sim_dataset import StationaryDataset
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -32,8 +36,10 @@ def main(args):
     pl.seed_everything(args.seed)
     # pdb.set_trace()
 
-    data = StationaryDataset(directory=cfg['ROOT'],
-                             transition=cfg['DATASET'])
+    # data = StationaryDataset(directory=cfg['ROOT'],
+    #                          transition=cfg['DATASET'])
+    
+    data = StationaryDataset(directory=cfg['ROOT'])
 
     num_validation_samples = cfg['VAE']['N_VAL_SAMPLES']
     train_data, val_data = random_split(data, [len(data)-num_validation_samples, num_validation_samples])
@@ -69,6 +75,8 @@ def main(args):
                               correlation=cfg['MCC']['CORR'])
     
     log_dir = os.path.join(cfg["LOG"], current_user, args.exp)
+    
+    tb_logger = TensorBoardLogger(save_dir=log_dir, name="tensorboard_logs")
 
     checkpoint_callback = ModelCheckpoint(monitor='val_mcc',
                                           save_top_k=1, 
@@ -81,10 +89,13 @@ def main(args):
                                         mode="max")
 
     trainer = pl.Trainer(default_root_dir=log_dir,
-                         gpus=cfg['VAE']['GPU'], 
+                        #  gpus=cfg['VAE']['GPU'], 
+                         logger=tb_logger,  # Add the TensorBoard logger here
                          val_check_interval = cfg['MCC']['FREQ'],
-                         max_epochs=cfg['VAE']['EPOCHS'],
-                         callbacks=[checkpoint_callback, early_stop_callback])
+                         max_epochs=cfg['VAE']['EPOCHS']
+                         , callbacks=checkpoint_callback,
+                         log_every_n_steps=1)
+                                    #   , early_stop_callback])
 
     # Train the model
     trainer.fit(model, train_loader, val_loader)
@@ -95,8 +106,9 @@ if __name__ == "__main__":
     argparser.add_argument(
         '-e',
         '--exp',
-        type=str
-    )
+        type=str,
+        default='caring_ng_tdmp'
+        )
 
     argparser.add_argument(
         '-s',

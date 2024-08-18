@@ -10,7 +10,10 @@ class StationaryDataset(Dataset):
     
     def __init__(self, directory, transition="noisecoupled_gaussian_ts_2lag"):
         super().__init__()
-        self.path = os.path.join(directory, transition, "data.npz")
+        
+        # self.path = os.path.join(directory, transition, "data.npz")
+        
+        self.path = os.path.join(directory, "data.npz")
         self.npz = np.load(self.path)
         self.data = { }
         for key in ["yt", "xt"]:

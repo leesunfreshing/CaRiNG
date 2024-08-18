@@ -1,10 +1,66 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
+
+
+class JacobianWeightedLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input, jacobian_layer=None, mask=None):
+        if jacobian_layer is None:
+            jacobian_layer = self.weight.unsqueeze(0).expand(input.size(0), -1, -1)
+        
+        if mask is not None:
+            jacobian_layer = jacobian_layer * mask.unsqueeze(1)
+        
+        output = torch.bmm(jacobian_layer, input.unsqueeze(-1)).squeeze(-1)
+        if self.bias is not None:
+            output += self.bias
+        
+        return output
+
+class JacobianWeightedMLP(nn.Module):
+    def __init__(self, in_features, out_features, num_layers, hidden_dim=64, bias=True):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for l in range(num_layers):
+            if l == 0:
+                self.layers.append(JacobianWeightedLinear(in_features, hidden_dim, bias))
+            else:
+                self.layers.append(JacobianWeightedLinear(hidden_dim, hidden_dim, bias))
+        self.layers.append(JacobianWeightedLinear(hidden_dim, out_features, bias))
+
+    def forward(self, x, jacobian=None, mask=None):
+        for i, layer in enumerate(self.layers):
+            x, jacobian = layer(x, jacobian, mask)
+            if i < len(self.layers) - 1:
+                x = F.leaky_relu(x, 0.2)
+                # Update jacobian for LeakyReLU
+                # leaky_relu_grad = torch.where(x > 0, torch.ones_like(x), torch.full_like(x, 0.2))
+                # jacobian = jacobian * leaky_relu_grad.unsqueeze(1)
+        return x
+
 
 class NLayerLeakyMLP(nn.Module):
 
-    def __init__(self, in_features, out_features, num_layers, hidden_dim=64, bias=True):
+    def __init__(self, in_features, out_features, num_layers, hidden_dim=64, bias=False):
         super().__init__()
         layers = [ ]
         for l in range(num_layers):

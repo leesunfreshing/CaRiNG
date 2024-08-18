@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.autograd import Variable
+from torch.autograd.functional import jacobian
 import numpy as np
 from .keypoint import SpatialSoftmax
 import ipdb as pdb
@@ -382,6 +383,170 @@ class BetaVAE_MLP(nn.Module):
 
     def _decode(self, z):
         return self.decoder(z)
+    
+    
+class BetaVAE_SparseMLP(nn.Module):
+    """Model proposed in original beta-VAE paper(Higgins et al, ICLR, 2017)."""
+
+    def __init__(self, input_dim=3, z_dim=10, decoder_side_truez=0, decoder_side_hatz=0,decoder_side_truex=0,encoder_side_truez=0, encoder_side_truex=0, hidden_dim=128, epsilon=1e-6):
+        super(BetaVAE_SparseMLP, self).__init__()
+        self.z_dim = z_dim
+        self.input_dim = input_dim
+        self.decoder_side_truez = decoder_side_truez
+        self.decoder_side_hatz = decoder_side_hatz
+        self.decoder_side_truex = decoder_side_truex
+        self.encoder_side_truez = encoder_side_truez
+        self.encoder_side_truex = encoder_side_truex
+        
+        dec_sidevars = [self.decoder_side_truez, self.decoder_side_hatz, self.decoder_side_truex]
+        enc_didevars = [self.encoder_side_truez, self.encoder_side_truex]
+
+        # get the non-zero value for decoder_side
+        dec_sidelen = next((var for var in dec_sidevars if var != 0), 0)
+
+        # get the non-zero value for encoder_side
+        enc_sidelen = next((var for var in enc_didevars if var != 0), 0)
+
+
+        self.input_dim_sid_enc = input_dim + enc_sidelen * input_dim
+
+        self.input_dim_sid_dec = z_dim + dec_sidelen * z_dim
+
+        self.encoder = nn.Sequential(
+                                       nn.Linear(self.input_dim_sid_enc, hidden_dim),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Linear(hidden_dim, 2*z_dim)
+                                    )
+        # Fix the functional form to ground-truth mixing function
+        self.decoder = nn.Sequential(  nn.LeakyReLU(0.2),
+                                       nn.Linear(self.input_dim_sid_dec, hidden_dim),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Linear(hidden_dim, hidden_dim),
+                                       nn.LeakyReLU(0.2),
+                                       nn.Linear(hidden_dim, input_dim)
+                                    )
+        
+        # self.epsilon = epsilon
+
+        self.weight_init()
+
+    def weight_init(self):
+        for block in self._modules:
+            for m in self._modules[block]:
+                kaiming_init(m)
+
+    def forward(self, x, y, return_z=True):
+        batch_size = x.shape[0]
+        length = x.shape[1]
+       
+        if self.encoder_side_truez != 0:
+            x_tmp = x.clone()
+            x_fuse = [] 
+            x_fuse.append(x_tmp)
+            for i in range(self.encoder_side_truez):
+                y_tmp = y[:,self.encoder_side_truez - (i+1):-(i+1)]
+                y_pad = F.pad(y_tmp, (0, 0, self.encoder_side_truez, 0))
+                x_fuse.append(y_pad)
+                
+            x_side = torch.cat(x_fuse, dim=2)
+            x_flat = x_side.view(-1, self.input_dim_sid_enc)
+            distributions = self._encode(x_flat)
+        elif self.encoder_side_truex != 0:
+            x_tmp = x.clone()
+            x_fuse = [] 
+            x_fuse.append(x_tmp)
+            for i in range(self.encoder_side_truex):
+                x_tmp = x[:,self.encoder_side_truex - (i+1):-(i+1)]
+                x_pad = F.pad(x_tmp, (0, 0, self.encoder_side_truex, 0))
+                x_fuse.append(x_pad)
+
+            x_side = torch.cat(x_fuse, dim=2)
+            x_flat = x_side.view(-1, self.input_dim_sid_enc)
+            distributions = self._encode(x_flat)
+        else:
+            x_flat = x.view(-1, self.input_dim)
+            # y_flat = y.view(-1, self.z_dim)
+            distributions = self._encode(x_flat)
+        mu = distributions[:, :self.z_dim]
+        logvar = distributions[:, self.z_dim:]
+        z = reparametrize(mu, logvar)
+
+        if self.decoder_side_truez != 0:
+            z_tmp = z.clone().reshape(batch_size,length, self.z_dim)
+            z_fuse = [] 
+            z_fuse.append(z_tmp)
+            for i in range(self.decoder_side_truez):
+                y_tmp = y[:,self.decoder_side_truez - (i+1):-(i+1)]
+                y_pad = F.pad(y_tmp, (0, 0, self.decoder_side_truez, 0))
+                z_fuse.append(y_pad)
+                
+            z_side = torch.cat(z_fuse, dim=2)
+            z_flat = z_side.view(-1, self.input_dim_sid_dec)
+            x_recon = self._decode(z_flat)
+        elif self.decoder_side_hatz != 0:
+            zs = [z]
+
+            for i in range(self.decoder_side_hatz):
+                z_tmp = z.detach().reshape(batch_size,length, self.z_dim) # BS, LEN, DIM
+                z_tmp = z_tmp[:, i+1:, :]
+                z_tmp = torch.cat((z_tmp, torch.zeros((batch_size, i+1, self.z_dim)).cuda()), 1)
+                z_tmp = z_tmp.reshape(-1, self.z_dim)
+                zs.append(z_tmp)
+
+            z_flat = torch.cat(zs, 1)
+            x_recon = self._decode(z_flat)
+
+        elif self.decoder_side_truex != 0:
+            z_tmp = z.clone().reshape(batch_size,length, self.z_dim)
+            z_fuse = [] 
+            z_fuse.append(z_tmp)
+            for i in range(self.decoder_side_truex):
+                x_tmp = x[:,self.decoder_side_truex - (i+1):-(i+1)]
+                x_pad = F.pad(x_tmp, (0, 0, self.decoder_side_truex, 0))
+                z_fuse.append(x_pad)
+            
+            z_side = torch.cat(z_fuse, dim=2)
+            z_flat = z_side.view(-1, self.input_dim_sid_dec)
+            x_recon = self._decode(z_flat)
+        else:
+            x_recon, jac, l1_penalty = self._decode(z)
+
+
+        if return_z:
+            return x_recon, mu, logvar, z, jac, l1_penalty
+        else:
+            return x_recon, mu, logvar, jac, l1_penalty
+
+    def _encode(self, x):
+        return self.encoder(x)
+
+    def _decode(self, z):
+        
+        def decode_fn(z):
+            return self.decoder(z)
+
+        # Compute the Jacobian
+        jac = []
+        for b_size in range(z.shape[0]//9):
+            jac_t = []
+            for t in range(9):        
+                # with torch.enable_grad(): 
+                    jac_t.append(jacobian(decode_fn, z[b_size*9+t], create_graph=True, vectorize=True))
+            
+            jac_t = torch.stack(jac_t, dim=0)
+            
+            jac.append(jac_t)
+            
+        jac = torch.stack(jac, dim=0)
+        
+        return self.decoder(z), jac, torch.norm(jac, p=0, dim=-1).mean()
+    
 
 def kaiming_init(m):
     if isinstance(m, (nn.Linear, nn.Conv2d)):
